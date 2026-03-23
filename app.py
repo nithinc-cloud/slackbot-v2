@@ -23,11 +23,11 @@ logger = logging.getLogger(__name__)
 REQUIRED_ENVS = ["APP_TOKEN", "BOT_TOKEN", "TARGET_CHANNEL_ID", "CHANNEL_IDS"]
 env = {k: os.environ.get(k) for k in REQUIRED_ENVS}
 
-app_token        = env["APP_TOKEN"]
-bot_token        = env["BOT_TOKEN"]
+app_token         = env["APP_TOKEN"]
+bot_token         = env["BOT_TOKEN"]
 target_channel_id = env["TARGET_CHANNEL_ID"]
-channel_ids      = [c.strip() for c in env["CHANNEL_IDS"].split(",") if c.strip()]
-patterns_path    = os.environ.get("PATTERNS_PATH", "/appz/scripts/webapps/patterns.json")
+channel_ids       = [c.strip() for c in env["CHANNEL_IDS"].split(",") if c.strip()]
+patterns_path     = os.environ.get("PATTERNS_PATH", "/appz/scripts/webapps/patterns.json")
 
 if not all([app_token, bot_token, target_channel_id, channel_ids]):
     logger.error("Missing required environment variables. Aborting.")
@@ -54,7 +54,11 @@ STATE_COLORS = {
     "Recovered":    "#2EB67D",
 }
 
-STATE_EMOJIS = {}
+# Zabbix-only emojis — Datadog alerts get no emoji
+ZABBIX_EMOJIS = {
+    "Triggered": "🔴",
+    "Recovered":  "✅",
+}
 
 ALERT_REGEX = re.compile(
     r'(?i)(Triggered|Recovered|Re-Triggered):\s*(?:\[[^\]]+\]\s*)*(.+)'
@@ -98,15 +102,16 @@ def format_sources(alert_name):
 
 # ---------------- ALERT PARSING ---------------- #
 def extract_alert(text):
-    """Parse alert text. Returns (state, alert_name, show_link) or (None, None, True)."""
+    """Parse alert text. Returns (state, alert_name, show_link, emoji) or (None, None, True, "")."""
 
     # Standard alert format: Triggered/Re-Triggered/Recovered: [tag] alert name
+    # No emoji for Datadog alerts
     match = ALERT_REGEX.search(text)
     if match:
-        state = match.group(1).title()
+        state      = match.group(1).title()
         alert_name = match.group(2).split("\n")[0].strip()
         logger.info("Standard alert parsed | state=%s alert=%s", state, alert_name)
-        return state, alert_name, True
+        return state, alert_name, True, ""
 
     # Zabbix alert format: Issue started/resolved
     return _extract_zabbix_alert(text)
@@ -114,7 +119,7 @@ def extract_alert(text):
 def _extract_zabbix_alert(text):
     match = ZABBIX_REGEX.search(text)
     if not match:
-        return None, None, True
+        return None, None, True, ""
 
     lifecycle  = match.group(2).lower()
     alert_name = match.group(3).strip()
@@ -122,29 +127,67 @@ def _extract_zabbix_alert(text):
 
     if lifecycle == "started":
         state     = "Triggered"
-        show_link = False  # no permalink for Zabbix "Issue started"
+        show_link = False
     elif lifecycle == "resolved":
         state     = "Recovered"
         show_link = False
     else:
-        return None, None, True
+        return None, None, True, ""
 
     full_alert_name = f"{alert_name} ({server})"
+    emoji = ZABBIX_EMOJIS.get(state, "")
     logger.info(
         "Zabbix alert parsed | state=%s alert=%s server=%s show_link=%s",
         state, alert_name, server, show_link,
     )
-    return state, full_alert_name, show_link
+    return state, full_alert_name, show_link, emoji
 
 # ---------------- CACHE / DEDUP ---------------- #
 recent_messages_cache = {}
+
+def _update_sources_in_message(alert_name, message_ts):
+    """Edit the already-forwarded Triggered message to add newly discovered source channels."""
+    try:
+        sources = format_sources(alert_name)
+        history = app.client.conversations_history(
+            channel=target_channel_id,
+            latest=message_ts,
+            inclusive=True,
+            limit=1,
+        )
+        messages = history.get("messages", [])
+        if not messages:
+            return
+
+        existing_blocks = messages[0].get("blocks", [])
+        if not existing_blocks:
+            return
+
+        # Patch the Sources line in the existing text block
+        original_text = existing_blocks[0]["text"]["text"]
+        updated_text  = re.sub(r"Sources:.*$", f"Sources: {sources}", original_text)
+
+        app.client.chat_update(
+            channel=target_channel_id,
+            ts=message_ts,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": updated_text}}],
+        )
+        logger.info("Updated sources in forwarded message | alert=%s sources=%s", alert_name, sources)
+    except Exception as e:
+        logger.error(f"Failed to update message sources: {e}")
 
 def should_forward_alert(alert_name, state, channel_id):
     """Returns True if the alert should be forwarded based on dedup and lifecycle rules."""
     now   = now_utc()
     entry = recent_messages_cache.setdefault(
         alert_name,
-        {"states": {}, "channels": set(), "incident_active": False, "first_seen": now},
+        {
+            "states":          {},
+            "channels":        set(),
+            "incident_active": False,
+            "first_seen":      now,
+            "forwarded_ts":    None,   # ts of the forwarded Triggered message
+        },
     )
 
     entry["channels"].add(channel_id)
@@ -158,6 +201,9 @@ def should_forward_alert(alert_name, state, channel_id):
     last_seen = entry["states"].get(state)
     window    = TIME_WINDOWS.get(state)
     if last_seen and window and (now - last_seen) <= window:
+        # Suppressed — but update the original Triggered message with the new source channel
+        if state == "Triggered" and entry.get("forwarded_ts"):
+            _update_sources_in_message(alert_name, entry["forwarded_ts"])
         logger.info("Alert suppressed | reason=time_window state=%s alert=%s", state, alert_name)
         return False
 
@@ -169,28 +215,32 @@ def should_forward_alert(alert_name, state, channel_id):
     return True
 
 # ---------------- SEND MESSAGE ---------------- #
-def send_to_target(original_message, channel_id, message_ts, state, alert_name, show_link):
+def send_to_target(original_message, channel_id, message_ts, state, alert_name, show_link, emoji=""):
     logger.info(
         "Forwarding alert | state=%s alert=%s source_channel=%s show_link=%s",
         state, alert_name, channel_id, show_link,
     )
 
     sources = format_sources(alert_name)
-    emoji   = STATE_EMOJIS.get(state, "")
+    prefix  = f"{emoji} " if emoji else ""
 
     if show_link:
         permalink = get_permalink(channel_id, message_ts)
-        text = f"{emoji} *<{permalink}|{original_message}>*\nSources: {sources}"
+        text = f"{prefix}*<{permalink}|{original_message}>*\nSources: {sources}"
     else:
-        text = f"{emoji} *{original_message}*\nSources: {sources}"
+        text = f"{prefix}*{original_message}*\nSources: {sources}"
 
     try:
-        app.client.chat_postMessage(
+        result = app.client.chat_postMessage(
             channel=target_channel_id,
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
             attachments=[{"color": STATE_COLORS.get(state, "#CCCCCC")}],
             unfurl_links=False,
         )
+        # Store the forwarded message ts so we can update sources if more channels report it
+        if state in ("Triggered", "Re-Triggered") and alert_name in recent_messages_cache:
+            recent_messages_cache[alert_name]["forwarded_ts"] = result["ts"]
+
         logger.info("Alert sent successfully | state=%s alert=%s", state, alert_name)
     except Exception as e:
         logger.error(f"Send failed: {e}")
@@ -199,7 +249,7 @@ def send_to_target(original_message, channel_id, message_ts, state, alert_name, 
 def handle_alert(original_message, channel_id, message_ts):
     logger.info("Message received | channel=%s ts=%s", channel_id, message_ts)
 
-    state, alert_name, show_link = extract_alert(original_message)
+    state, alert_name, show_link, emoji = extract_alert(original_message)
 
     if not state or not alert_name:
         logger.info("Message ignored | reason=not_an_alert")
@@ -220,7 +270,7 @@ def handle_alert(original_message, channel_id, message_ts):
     if not should_forward_alert(alert_name, state, channel_id):
         return
 
-    send_to_target(original_message, channel_id, message_ts, state, alert_name, show_link)
+    send_to_target(original_message, channel_id, message_ts, state, alert_name, show_link, emoji)
 
     if state == "Recovered":
         recent_messages_cache.pop(alert_name, None)
