@@ -189,8 +189,6 @@ def send_to_target(original_message, channel_id, message_ts, state, alert_name, 
         permalink = get_permalink(channel_id, message_ts)
         text = f"{prefix}*<{permalink}|{original_message}>*\nSources: {sources}"
     else:
-        # Zabbix alerts — bold only the first line, rest renders as plain text
-        # (mrkdwn bold does not span newlines, so wrapping the whole message breaks)
         lines      = original_message.split("\n")
         first_line = f"*{lines[0].strip()}*"
         rest       = "\n".join(lines[1:]).strip()
