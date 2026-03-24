@@ -1,7 +1,7 @@
 app: 
   code: slackbot
   name: SLACKBOT
-  notify: appzdev@cloudbourne.co
+  #notify: appzdev@cloudbourne.co
 build: 
   build_file: none
   env: DEV
@@ -9,7 +9,7 @@ build:
   output_files: output/*.zip
   version: 1.0
 deploy: 
-  context: ecloudcontrol/DEV
+  context: nithinc-cloud/DEV
   replicas: 1
   ingress: none
 properties:
@@ -17,7 +17,7 @@ properties:
     vault: APP_TOKEN
   BOT_TOKEN:
     vault: BOT_TOKEN
-  TARGET_CHANNEL_ID: C01U76CFJSD  
-  CHANNEL_IDS: C053Q8EARFA,C03SBEKHTDX,C0692SBTKLP,C092QGFR11V,C03RYR4V5T4,C06U09WJ458,C09QF5K5CBE
+  TARGET_CHANNEL_ID: C0A3XHP568L 
+  CHANNEL_IDS: C0A46TJVD2M,C0A44A1CHHD
   PYTHONIOENCODING: UTF-8
-  revision: 14
+  revision: 26
